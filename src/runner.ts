@@ -44,6 +44,14 @@ export function killActive(): boolean {
   return true;
 }
 
+// Tracks whether the main serial queue is currently executing
+let mainRunning = false;
+
+/** True while the main agent is processing a task (excludes fork). */
+export function isMainBusy(): boolean {
+  return mainRunning;
+}
+
 function extractRateLimitMessage(stdout: string, stderr: string): string | null {
   const candidates = [stdout, stderr];
   for (const text of candidates) {
@@ -237,6 +245,8 @@ export async function loadHeartbeatPromptTemplate(): Promise<string> {
 }
 
 async function execClaude(name: string, prompt: string): Promise<RunResult> {
+  mainRunning = true;
+  try {
   await mkdir(LOGS_DIR, { recursive: true });
 
   const existing = await getSession();
@@ -353,6 +363,9 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
   console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} → ${logFile}`);
 
   return result;
+  } finally {
+    mainRunning = false;
+  }
 }
 
 export async function run(name: string, prompt: string): Promise<RunResult> {
