@@ -300,6 +300,51 @@ async function sendTyping(token: string, chatId: number, threadId?: number): Pro
   }).catch(() => {});
 }
 
+/**
+ * Send or update a streaming draft message (Bot API 9.5+).
+ */
+async function sendMessageDraft(token: string, chatId: number, text: string, threadId?: number): Promise<void> {
+  const normalized = normalizeTelegramText(text);
+  const html = markdownToTelegramHtml(normalized);
+  await callApi(token, "sendMessageDraft", {
+    chat_id: chatId,
+    text: html.slice(0, 4096),
+    parse_mode: "HTML",
+    ...(threadId ? { message_thread_id: threadId } : {}),
+  }).catch(() => {});
+}
+
+/** Build a throttled onChunk callback that streams partial text to Telegram via sendMessageDraft. */
+function makeStreamCallback(
+  token: string,
+  chatId: number,
+  threadId: number | undefined,
+  intervalMs = 500
+): { onChunk: (text: string) => void; getAccumulated: () => string } {
+  let accumulated = "";
+  let lastSentAt = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const flush = () => {
+    if (!accumulated) return;
+    lastSentAt = Date.now();
+    sendMessageDraft(token, chatId, accumulated, threadId);
+  };
+
+  const onChunk = (text: string) => {
+    accumulated += text;
+    const now = Date.now();
+    if (now - lastSentAt >= intervalMs) {
+      if (timer) { clearTimeout(timer); timer = null; }
+      flush();
+    } else if (!timer) {
+      timer = setTimeout(() => { timer = null; flush(); }, intervalMs - (now - lastSentAt));
+    }
+  };
+
+  return { onChunk, getAccumulated: () => accumulated };
+}
+
 function extractReactionDirective(text: string): { cleanedText: string; reactionEmoji: string | null } {
   let reactionEmoji: string | null = null;
   const cleanedText = text
@@ -629,9 +674,13 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     }
     const prefixedPrompt = promptParts.join("\n");
     const busy = isMainBusy();
-    const result = busy
-      ? await runFork(prefixedPrompt)
-      : await runUserMessage("telegram", prefixedPrompt);
+    let result;
+    if (busy) {
+      result = await runFork(prefixedPrompt);
+    } else {
+      const stream = makeStreamCallback(config.token, chatId, threadId);
+      result = await runUserMessage("telegram", prefixedPrompt, stream.onChunk);
+    }
 
     if (result.exitCode !== 0) {
       await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);

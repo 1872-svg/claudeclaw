@@ -122,6 +122,85 @@ async function runClaudeOnce(
   };
 }
 
+/**
+ * Run claude with --output-format stream-json, emitting text chunks via onChunk
+ * as assistant messages arrive. Session ID and final result come from the result event.
+ */
+async function runClaudeStreaming(
+  baseArgs: string[],
+  model: string,
+  api: string,
+  baseEnv: Record<string, string>,
+  onChunk?: (text: string) => void
+): Promise<{ result: string; stderr: string; exitCode: number; sessionId?: string; isRateLimit: boolean }> {
+  const args = [...baseArgs];
+  const normalizedModel = model.trim().toLowerCase();
+  if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
+
+  const proc = Bun.spawn(args, {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: buildChildEnv(baseEnv, model, api),
+  });
+
+  activeProc = proc;
+  const stderrPromise = new Response(proc.stderr).text();
+
+  let finalResult = "";
+  let sessionId: string | undefined;
+  let isRateLimit = false;
+  let delivered = ""; // text already sent to onChunk
+
+  const reader = proc.stdout.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) !== -1) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+
+      try {
+        const event = JSON.parse(line);
+
+        if (event.type === "assistant" && event.message?.content && onChunk) {
+          // Accumulate text across all content blocks in this message
+          let full = "";
+          for (const block of event.message.content) {
+            if (block.type === "text" && typeof block.text === "string") full += block.text;
+          }
+          // Deliver only the new portion since last delivery
+          if (full.length > delivered.length) {
+            onChunk(full.slice(delivered.length));
+            delivered = full;
+          }
+        }
+
+        if (event.type === "result") {
+          sessionId = event.session_id;
+          finalResult = typeof event.result === "string" ? event.result : finalResult;
+          isRateLimit = RATE_LIMIT_PATTERN.test(finalResult);
+        }
+      } catch {}
+    }
+  }
+
+  await proc.exited;
+  if (activeProc === proc) activeProc = null;
+
+  const stderr = await stderrPromise;
+  // Also check stderr for rate limit signals
+  if (!isRateLimit) isRateLimit = RATE_LIMIT_PATTERN.test(stderr);
+
+  return { result: finalResult, stderr, exitCode: proc.exitCode ?? 1, sessionId, isRateLimit };
+}
+
 const PROJECT_DIR = process.cwd();
 
 const DIR_SCOPE_PROMPT = [
@@ -244,7 +323,7 @@ export async function loadHeartbeatPromptTemplate(): Promise<string> {
   return "";
 }
 
-async function execClaude(name: string, prompt: string): Promise<RunResult> {
+async function execClaude(name: string, prompt: string, onChunk?: (text: string) => void): Promise<RunResult> {
   mainRunning = true;
   try {
   await mkdir(LOGS_DIR, { recursive: true });
@@ -266,25 +345,15 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
     `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
   );
 
-  // New session: use json output to capture Claude's session_id
-  // Resumed session: use text output with --resume
-  const outputFormat = isNew ? "json" : "text";
-  const args = ["claude", "-p", prompt, "--output-format", outputFormat, ...securityArgs];
+  // Always use stream-json — session_id comes from the result event for both new and resumed
+  const args = ["claude", "-p", prompt, "--output-format", "stream-json", ...securityArgs];
+  if (!isNew) args.push("--resume", existing.sessionId);
 
-  if (!isNew) {
-    args.push("--resume", existing.sessionId);
-  }
-
-  // Build the appended system prompt: prompt files + directory scoping
-  // This is passed on EVERY invocation (not just new sessions) because
-  // --append-system-prompt does not persist across --resume.
+  // Build the appended system prompt (re-sent every turn since --append-system-prompt doesn't persist)
   const promptContent = await loadPrompts();
-  const appendParts: string[] = [
-    "You are running inside ClaudeClaw.",
-  ];
+  const appendParts: string[] = ["You are running inside ClaudeClaw."];
   if (promptContent) appendParts.push(promptContent);
 
-  // Load the project's CLAUDE.md if it exists
   if (existsSync(PROJECT_CLAUDE_MD)) {
     try {
       const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
@@ -295,56 +364,32 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
   }
 
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
-  if (appendParts.length > 0) {
-    args.push("--append-system-prompt", appendParts.join("\n\n"));
-  }
+  if (appendParts.length > 0) args.push("--append-system-prompt", appendParts.join("\n\n"));
 
-  // Strip CLAUDECODE env var so child claude processes don't think they're nested
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
   const baseEnv = { ...cleanEnv } as Record<string, string>;
 
-  let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv);
-  const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
+  let exec = await runClaudeStreaming(args, primaryConfig.model, primaryConfig.api, baseEnv, onChunk);
   let usedFallback = false;
 
-  if (primaryRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
+  if (exec.isRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
     console.warn(
       `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`
     );
-    exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv);
+    exec = await runClaudeStreaming(args, fallbackConfig.model, fallbackConfig.api, baseEnv, onChunk);
     usedFallback = true;
   }
 
-  const rawStdout = exec.rawStdout;
-  const stderr = exec.stderr;
-  const exitCode = exec.exitCode;
-  let stdout = rawStdout;
-  let sessionId = existing?.sessionId ?? "unknown";
-  const rateLimitMessage = extractRateLimitMessage(rawStdout, stderr);
+  const { result: stdout, stderr, exitCode, sessionId: streamedSessionId } = exec;
+  let sessionId = streamedSessionId ?? existing?.sessionId ?? "unknown";
 
-  if (rateLimitMessage) {
-    stdout = rateLimitMessage;
+  // Persist session ID — works for both new and resumed (stream-json always emits it)
+  if (streamedSessionId && (isNew || streamedSessionId !== existing?.sessionId)) {
+    await createSession(streamedSessionId);
+    if (isNew) console.log(`[${new Date().toLocaleTimeString()}] Session created: ${streamedSessionId}`);
   }
 
-  // For new sessions, parse the JSON to extract session_id and result text
-  if (!rateLimitMessage && isNew && exitCode === 0) {
-    try {
-      const json = JSON.parse(rawStdout);
-      sessionId = json.session_id;
-      stdout = json.result ?? "";
-      // Save the real session ID from Claude Code
-      await createSession(sessionId);
-      console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}`);
-    } catch (e) {
-      console.error(`[${new Date().toLocaleTimeString()}] Failed to parse session from Claude output:`, e);
-    }
-  }
-
-  const result: RunResult = {
-    stdout,
-    stderr,
-    exitCode,
-  };
+  const result: RunResult = { stdout, stderr, exitCode };
 
   const output = [
     `# ${name}`,
@@ -352,7 +397,7 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
     `Session: ${sessionId} (${isNew ? "new" : "resumed"})`,
     `Model config: ${usedFallback ? "fallback" : "primary"}`,
     `Prompt: ${prompt}`,
-    `Exit code: ${result.exitCode}`,
+    `Exit code: ${exitCode}`,
     "",
     "## Output",
     stdout,
@@ -368,8 +413,8 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
   }
 }
 
-export async function run(name: string, prompt: string): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt));
+export async function run(name: string, prompt: string, onChunk?: (text: string) => void): Promise<RunResult> {
+  return enqueue(() => execClaude(name, prompt, onChunk));
 }
 
 function prefixUserMessageWithClock(prompt: string): string {
@@ -383,8 +428,8 @@ function prefixUserMessageWithClock(prompt: string): string {
   }
 }
 
-export async function runUserMessage(name: string, prompt: string): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt));
+export async function runUserMessage(name: string, prompt: string, onChunk?: (text: string) => void): Promise<RunResult> {
+  return run(name, prefixUserMessageWithClock(prompt), onChunk);
 }
 
 // Path where Claude Code stores session JSONL transcripts for this project
