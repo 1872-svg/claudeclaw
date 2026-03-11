@@ -381,8 +381,14 @@ function makeStreamCallback(
   const onToolEvent = (line: string) => {
     if (!verbose) return;
     toolLines.push(line);
-    if (timer) { clearTimeout(timer); timer = null; }
-    flush();
+    // Use same throttle logic as onChunk to avoid spamming the API
+    const now = Date.now();
+    if (now - lastSentAt >= intervalMs) {
+      if (timer) { clearTimeout(timer); timer = null; }
+      flush();
+    } else if (!timer) {
+      timer = setTimeout(() => { timer = null; flush(); }, intervalMs - (now - lastSentAt));
+    }
   };
 
   const waitForStreamMsg = async (): Promise<number | null> => {

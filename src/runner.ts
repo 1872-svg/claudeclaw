@@ -122,10 +122,6 @@ async function runClaudeOnce(
   };
 }
 
-/**
- * Run claude with --output-format stream-json, emitting text chunks via onChunk
- * as assistant messages arrive. Session ID and final result come from the result event.
- */
 function formatToolCallSummary(name: string, input: Record<string, unknown>): string {
   const s = (v: unknown, max = 50) => String(v ?? "").slice(0, max);
   switch (name) {
@@ -152,6 +148,11 @@ function extractToolResultText(content: unknown): string {
   return String(content ?? "");
 }
 
+/**
+ * Run claude with --output-format stream-json, emitting text chunks via onChunk
+ * and tool call/result lines via onToolEvent as they arrive.
+ * Session ID and final result come from the result event.
+ */
 async function runClaudeStreaming(
   baseArgs: string[],
   model: string,
@@ -376,89 +377,89 @@ export async function loadHeartbeatPromptTemplate(): Promise<string> {
 async function execClaude(name: string, prompt: string, onChunk?: (text: string) => void, onToolEvent?: (line: string) => void): Promise<RunResult> {
   mainRunning = true;
   try {
-  await mkdir(LOGS_DIR, { recursive: true });
+    await mkdir(LOGS_DIR, { recursive: true });
 
-  const existing = await getSession();
-  const isNew = !existing;
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const logFile = join(LOGS_DIR, `${name}-${timestamp}.log`);
+    const existing = await getSession();
+    const isNew = !existing;
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const logFile = join(LOGS_DIR, `${name}-${timestamp}.log`);
 
-  const { security, model, api, fallback } = getSettings();
-  const primaryConfig: ModelConfig = { model, api };
-  const fallbackConfig: ModelConfig = {
-    model: fallback?.model ?? "",
-    api: fallback?.api ?? "",
-  };
-  const securityArgs = buildSecurityArgs(security);
+    const { security, model, api, fallback } = getSettings();
+    const primaryConfig: ModelConfig = { model, api };
+    const fallbackConfig: ModelConfig = {
+      model: fallback?.model ?? "",
+      api: fallback?.api ?? "",
+    };
+    const securityArgs = buildSecurityArgs(security);
 
-  console.log(
-    `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
-  );
-
-  // Always use stream-json — session_id comes from the result event for both new and resumed
-  // --verbose is required by claude when using stream-json with --print
-  const args = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
-  if (!isNew) args.push("--resume", existing.sessionId);
-
-  // Build the appended system prompt (re-sent every turn since --append-system-prompt doesn't persist)
-  const promptContent = await loadPrompts();
-  const appendParts: string[] = ["You are running inside ClaudeClaw."];
-  if (promptContent) appendParts.push(promptContent);
-
-  if (existsSync(PROJECT_CLAUDE_MD)) {
-    try {
-      const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
-      if (claudeMd.trim()) appendParts.push(claudeMd.trim());
-    } catch (e) {
-      console.error(`[${new Date().toLocaleTimeString()}] Failed to read project CLAUDE.md:`, e);
-    }
-  }
-
-  if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
-  if (appendParts.length > 0) args.push("--append-system-prompt", appendParts.join("\n\n"));
-
-  const { CLAUDECODE: _, ...cleanEnv } = process.env;
-  const baseEnv = { ...cleanEnv } as Record<string, string>;
-
-  let exec = await runClaudeStreaming(args, primaryConfig.model, primaryConfig.api, baseEnv, onChunk, onToolEvent);
-  let usedFallback = false;
-
-  if (exec.isRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
-    console.warn(
-      `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`
+    console.log(
+      `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
     );
-    exec = await runClaudeStreaming(args, fallbackConfig.model, fallbackConfig.api, baseEnv, onChunk, onToolEvent);
-    usedFallback = true;
-  }
 
-  const { result: stdout, stderr, exitCode, sessionId: streamedSessionId } = exec;
-  let sessionId = streamedSessionId ?? existing?.sessionId ?? "unknown";
+    // Always use stream-json — session_id comes from the result event for both new and resumed
+    // --verbose is required by claude when using stream-json with --print
+    const args = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
+    if (!isNew) args.push("--resume", existing.sessionId);
 
-  // Persist session ID — works for both new and resumed (stream-json always emits it)
-  if (streamedSessionId && (isNew || streamedSessionId !== existing?.sessionId)) {
-    await createSession(streamedSessionId);
-    if (isNew) console.log(`[${new Date().toLocaleTimeString()}] Session created: ${streamedSessionId}`);
-  }
+    // Build the appended system prompt (re-sent every turn since --append-system-prompt doesn't persist)
+    const promptContent = await loadPrompts();
+    const appendParts: string[] = ["You are running inside ClaudeClaw."];
+    if (promptContent) appendParts.push(promptContent);
 
-  const result: RunResult = { stdout, stderr, exitCode };
+    if (existsSync(PROJECT_CLAUDE_MD)) {
+      try {
+        const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
+        if (claudeMd.trim()) appendParts.push(claudeMd.trim());
+      } catch (e) {
+        console.error(`[${new Date().toLocaleTimeString()}] Failed to read project CLAUDE.md:`, e);
+      }
+    }
 
-  const output = [
-    `# ${name}`,
-    `Date: ${new Date().toISOString()}`,
-    `Session: ${sessionId} (${isNew ? "new" : "resumed"})`,
-    `Model config: ${usedFallback ? "fallback" : "primary"}`,
-    `Prompt: ${prompt}`,
-    `Exit code: ${exitCode}`,
-    "",
-    "## Output",
-    stdout,
-    ...(stderr ? ["## Stderr", stderr] : []),
-  ].join("\n");
+    if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
+    if (appendParts.length > 0) args.push("--append-system-prompt", appendParts.join("\n\n"));
 
-  await Bun.write(logFile, output);
-  console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} → ${logFile}`);
+    const { CLAUDECODE: _, ...cleanEnv } = process.env;
+    const baseEnv = { ...cleanEnv } as Record<string, string>;
 
-  return result;
+    let exec = await runClaudeStreaming(args, primaryConfig.model, primaryConfig.api, baseEnv, onChunk, onToolEvent);
+    let usedFallback = false;
+
+    if (exec.isRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
+      console.warn(
+        `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`
+      );
+      exec = await runClaudeStreaming(args, fallbackConfig.model, fallbackConfig.api, baseEnv, onChunk, onToolEvent);
+      usedFallback = true;
+    }
+
+    const { result: stdout, stderr, exitCode, sessionId: streamedSessionId } = exec;
+    let sessionId = streamedSessionId ?? existing?.sessionId ?? "unknown";
+
+    // Persist session ID — works for both new and resumed (stream-json always emits it)
+    if (streamedSessionId && (isNew || streamedSessionId !== existing?.sessionId)) {
+      await createSession(streamedSessionId);
+      if (isNew) console.log(`[${new Date().toLocaleTimeString()}] Session created: ${streamedSessionId}`);
+    }
+
+    const result: RunResult = { stdout, stderr, exitCode };
+
+    const output = [
+      `# ${name}`,
+      `Date: ${new Date().toISOString()}`,
+      `Session: ${sessionId} (${isNew ? "new" : "resumed"})`,
+      `Model config: ${usedFallback ? "fallback" : "primary"}`,
+      `Prompt: ${prompt}`,
+      `Exit code: ${exitCode}`,
+      "",
+      "## Output",
+      stdout,
+      ...(stderr ? ["## Stderr", stderr] : []),
+    ].join("\n");
+
+    await Bun.write(logFile, output);
+    console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} → ${logFile}`);
+
+    return result;
   } finally {
     mainRunning = false;
   }
