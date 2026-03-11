@@ -202,6 +202,9 @@ async function runClaudeStreaming(
         if (event.type === "assistant" && event.message?.content) {
           const msgId: string = event.message.id ?? "";
           if (msgId !== lastMsgId) {
+            // Insert newline separator between assistant messages so text
+            // from successive turns doesn't merge onto one line.
+            if (onChunk && delivered) onChunk("\n");
             delivered = "";
             lastMsgId = msgId;
           }

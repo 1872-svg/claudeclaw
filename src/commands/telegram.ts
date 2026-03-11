@@ -325,13 +325,33 @@ function makeStreamCallback(
   let finalized = false;
 
   const getDisplay = () => {
-    const toolPart = toolLines.join("\n");
-    return toolPart + (textAcc ? (toolPart ? "\n\n" : "") + textAcc : "");
+    const MAX_TOOL_LINES = 8;
+    const MAX_TEXT_LINES = 15;
+    let toolPart: string;
+    if (toolLines.length > MAX_TOOL_LINES) {
+      const shown = toolLines.slice(-MAX_TOOL_LINES);
+      toolPart = `[...${toolLines.length - MAX_TOOL_LINES} earlier]\n` + shown.join("\n");
+    } else {
+      toolPart = toolLines.join("\n");
+    }
+    let textPart = textAcc;
+    const textLines = textPart.split("\n");
+    if (textLines.length > MAX_TEXT_LINES) {
+      textPart = `[...]\n` + textLines.slice(-MAX_TEXT_LINES).join("\n");
+    }
+    return toolPart + (textPart ? (toolPart ? "\n\n" : "") + textPart : "");
   };
 
   const editStream = () => {
     if (!streamMsgId || finalized) return;
-    const display = verbose ? getDisplay() : textAcc;
+    let display: string;
+    if (verbose) {
+      display = getDisplay();
+    } else {
+      // Keep last N lines of text for streaming preview
+      const lines = textAcc.split("\n");
+      display = lines.length > 30 ? `[...]\n${lines.slice(-30).join("\n")}` : textAcc;
+    }
     if (!display) return;
     callApi(token, "editMessageText", {
       chat_id: chatId,
@@ -783,7 +803,13 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         }).catch(() => callApi(config.token, "editMessageText", {
           chat_id: chatId, message_id: streamMsgId,
           text: finalText.slice(0, 4096),
-        }).catch(() => {}));
+        }).catch(() => {
+          // If all edits fail and verbose mode was on, the stream message still
+          // shows tool call output — send the final response as a new message.
+          if (verbose) {
+            return sendMessage(config.token, chatId, finalText, threadId);
+          }
+        }));
       } else {
         await sendMessage(config.token, chatId, finalText, threadId);
       }
