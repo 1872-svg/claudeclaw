@@ -301,45 +301,55 @@ async function sendTyping(token: string, chatId: number, threadId?: number): Pro
 }
 
 /**
- * Send or update a streaming draft message (Bot API 9.5+).
- * draft_id identifies this draft — repeated calls with the same ID animate the update.
- * Only works in private chats.
+ * Build a streaming callback using editMessageText.
+ * On first chunk: send a placeholder message to get message_id.
+ * On subsequent chunks (throttled): edit that message with accumulated plain text.
+ * Returns onChunk + getStreamMsgId so the handler can do a final formatted edit.
  */
-async function sendMessageDraft(
-  token: string,
-  chatId: number,
-  draftId: number,
-  text: string,
-  threadId?: number
-): Promise<void> {
-  const normalized = normalizeTelegramText(text);
-  // Draft updates use plain text to avoid parse errors mid-stream
-  await callApi(token, "sendMessageDraft", {
-    chat_id: chatId,
-    draft_id: draftId,
-    text: normalized.slice(0, 4096),
-    ...(threadId ? { message_thread_id: threadId } : {}),
-  }).catch(() => {});
-}
-
-/** Build a throttled onChunk callback that streams partial text to Telegram via sendMessageDraft. */
 function makeStreamCallback(
   token: string,
   chatId: number,
   threadId: number | undefined,
-  isPrivate: boolean,
   intervalMs = 500
-): { onChunk: (text: string) => void; getAccumulated: () => string } {
+): { onChunk: (text: string) => void; getStreamMsgId: () => number | null } {
   let accumulated = "";
   let lastSentAt = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
-  // draft_id is fixed for this message — same ID = animated update
-  const draftId = Math.floor(Math.random() * 2 ** 30) + 1;
+  let streamMsgId: number | null = null;
+  let initializing = false;
 
-  const flush = () => {
-    if (!accumulated || !isPrivate) return;
+  const editStream = () => {
+    if (!streamMsgId || !accumulated) return;
+    callApi(token, "editMessageText", {
+      chat_id: chatId,
+      message_id: streamMsgId,
+      text: accumulated.slice(0, 4096),
+    }).catch(() => {});
+  };
+
+  const flush = async () => {
+    if (!accumulated) return;
     lastSentAt = Date.now();
-    sendMessageDraft(token, chatId, draftId, accumulated, threadId);
+
+    if (!streamMsgId && !initializing) {
+      initializing = true;
+      try {
+        const res = await callApi<{ ok: boolean; result: { message_id: number } }>(
+          token, "sendMessage", {
+            chat_id: chatId,
+            text: "⏳",
+            ...(threadId ? { message_thread_id: threadId } : {}),
+          }
+        );
+        if (res.ok) {
+          streamMsgId = res.result.message_id;
+          editStream();
+        }
+      } catch {}
+      initializing = false;
+    } else {
+      editStream();
+    }
   };
 
   const onChunk = (text: string) => {
@@ -353,7 +363,7 @@ function makeStreamCallback(
     }
   };
 
-  return { onChunk, getAccumulated: () => accumulated };
+  return { onChunk, getStreamMsgId: () => streamMsgId };
 }
 
 function extractReactionDirective(text: string): { cleanedText: string; reactionEmoji: string | null } {
@@ -686,15 +696,24 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const prefixedPrompt = promptParts.join("\n");
     const busy = isMainBusy();
     let result;
+    let streamMsgId: number | null = null;
     if (busy) {
       result = await runFork(prefixedPrompt);
     } else {
-      const stream = makeStreamCallback(config.token, chatId, threadId, isPrivate);
+      const stream = makeStreamCallback(config.token, chatId, threadId);
       result = await runUserMessage("telegram", prefixedPrompt, stream.onChunk);
+      streamMsgId = stream.getStreamMsgId();
     }
 
     if (result.exitCode !== 0) {
-      await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);
+      const errText = `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`;
+      if (streamMsgId) {
+        await callApi(config.token, "editMessageText", {
+          chat_id: chatId, message_id: streamMsgId, text: errText,
+        }).catch(() => sendMessage(config.token, chatId, errText, threadId));
+      } else {
+        await sendMessage(config.token, chatId, errText, threadId);
+      }
     } else {
       const { cleanedText, reactionEmoji } = extractReactionDirective(result.stdout || "");
       if (reactionEmoji) {
@@ -702,7 +721,17 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
           console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
       }
-      await sendMessage(config.token, chatId, cleanedText || "(empty response)", threadId);
+      const finalText = cleanedText || "(empty response)";
+      if (streamMsgId) {
+        // Edit the streaming message with final formatted HTML
+        const html = markdownToTelegramHtml(normalizeTelegramText(finalText));
+        await callApi(config.token, "editMessageText", {
+          chat_id: chatId, message_id: streamMsgId,
+          text: html.slice(0, 4096), parse_mode: "HTML",
+        }).catch(() => sendMessage(config.token, chatId, finalText, threadId));
+      } else {
+        await sendMessage(config.token, chatId, finalText, threadId);
+      }
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
