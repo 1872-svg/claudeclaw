@@ -311,12 +311,12 @@ function makeStreamCallback(
   chatId: number,
   threadId: number | undefined,
   intervalMs = 500
-): { onChunk: (text: string) => void; getStreamMsgId: () => number | null } {
+): { onChunk: (text: string) => void; waitForStreamMsg: () => Promise<number | null> } {
   let accumulated = "";
   let lastSentAt = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let streamMsgId: number | null = null;
-  let initializing = false;
+  let initPromise: Promise<void> | null = null;
 
   const editStream = () => {
     if (!streamMsgId || !accumulated) return;
@@ -331,23 +331,25 @@ function makeStreamCallback(
     if (!accumulated) return;
     lastSentAt = Date.now();
 
-    if (!streamMsgId && !initializing) {
-      initializing = true;
-      try {
-        const res = await callApi<{ ok: boolean; result: { message_id: number } }>(
-          token, "sendMessage", {
-            chat_id: chatId,
-            text: "⏳",
-            ...(threadId ? { message_thread_id: threadId } : {}),
+    if (!streamMsgId && !initPromise) {
+      initPromise = (async () => {
+        try {
+          const res = await callApi<{ ok: boolean; result: { message_id: number } }>(
+            token, "sendMessage", {
+              chat_id: chatId,
+              text: "⏳",
+              ...(threadId ? { message_thread_id: threadId } : {}),
+            }
+          );
+          if (res.ok) {
+            streamMsgId = res.result.message_id;
+            editStream();
           }
-        );
-        if (res.ok) {
-          streamMsgId = res.result.message_id;
-          editStream();
-        }
-      } catch {}
-      initializing = false;
+        } catch {}
+      })();
+      await initPromise;
     } else {
+      if (initPromise) await initPromise;
       editStream();
     }
   };
@@ -363,7 +365,14 @@ function makeStreamCallback(
     }
   };
 
-  return { onChunk, getStreamMsgId: () => streamMsgId };
+  // Wait for any in-flight init to settle before caller checks streamMsgId
+  const waitForStreamMsg = async (): Promise<number | null> => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (initPromise) await initPromise;
+    return streamMsgId;
+  };
+
+  return { onChunk, waitForStreamMsg };
 }
 
 function extractReactionDirective(text: string): { cleanedText: string; reactionEmoji: string | null } {
@@ -702,7 +711,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     } else {
       const stream = makeStreamCallback(config.token, chatId, threadId);
       result = await runUserMessage("telegram", prefixedPrompt, stream.onChunk);
-      streamMsgId = stream.getStreamMsgId();
+      streamMsgId = await stream.waitForStreamMsg();
     }
 
     if (result.exitCode !== 0) {
