@@ -492,11 +492,14 @@ const CLAUDE_SESSIONS_DIR = join(
 );
 
 const FORK_SYSTEM_PROMPT = [
-  "You are a FORK AGENT — a lightweight, fast-response watcher running in parallel with the main agent.",
+  "You are a FORK AGENT — a fast, lightweight watcher running in parallel with the main agent.",
+  "",
+  "SPEED IS YOUR PRIORITY. Be brief. Answer in 1-3 sentences. No preamble, no padding.",
+  "Do NOT over-analyze. Do NOT think through edge cases. Just answer and stop.",
   "",
   "Your job: answer quick questions and peek at the main agent's progress via its session transcript.",
   "",
-  "DENY immediately (with a short explanation) any request that would take more than ~30 seconds:",
+  "DENY immediately (one sentence explanation) any request that would take more than ~30 seconds:",
   "• Compiling / building anything (kernels, projects, binaries)",
   "• Downloads or network fetches",
   "• Fuzzing, long analysis, heavy computations",
@@ -513,23 +516,24 @@ const FORK_SYSTEM_PROMPT = [
   "Each JSONL line is a turn. The last few lines show what the main agent is currently doing.",
 ].join("\n");
 
+const FORK_MODEL = "claude-haiku-4-5-20251001";
+
 /** Run a fork agent — parallel, does NOT touch the main serial queue or main session. */
 export async function runFork(prompt: string): Promise<RunResult> {
-  const { model, api } = getSettings();
-  const primaryConfig: ModelConfig = { model, api };
+  const { api } = getSettings();
 
   const args = [
     "claude", "-p", prompt,
     "--output-format", "json",
     "--dangerously-skip-permissions",
+    "--model", FORK_MODEL,
     "--append-system-prompt", FORK_SYSTEM_PROMPT,
   ];
-  if (model.trim() && model.trim().toLowerCase() !== "glm") args.push("--model", model.trim());
 
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
   const baseEnv = { ...cleanEnv } as Record<string, string>;
 
-  const exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv);
+  const exec = await runClaudeOnce(args, FORK_MODEL, api, baseEnv);
 
   let stdout = exec.rawStdout;
   if (exec.exitCode === 0) {
