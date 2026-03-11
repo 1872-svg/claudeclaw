@@ -302,14 +302,22 @@ async function sendTyping(token: string, chatId: number, threadId?: number): Pro
 
 /**
  * Send or update a streaming draft message (Bot API 9.5+).
+ * draft_id identifies this draft — repeated calls with the same ID animate the update.
+ * Only works in private chats.
  */
-async function sendMessageDraft(token: string, chatId: number, text: string, threadId?: number): Promise<void> {
+async function sendMessageDraft(
+  token: string,
+  chatId: number,
+  draftId: number,
+  text: string,
+  threadId?: number
+): Promise<void> {
   const normalized = normalizeTelegramText(text);
-  const html = markdownToTelegramHtml(normalized);
+  // Draft updates use plain text to avoid parse errors mid-stream
   await callApi(token, "sendMessageDraft", {
     chat_id: chatId,
-    text: html.slice(0, 4096),
-    parse_mode: "HTML",
+    draft_id: draftId,
+    text: normalized.slice(0, 4096),
     ...(threadId ? { message_thread_id: threadId } : {}),
   }).catch(() => {});
 }
@@ -319,16 +327,19 @@ function makeStreamCallback(
   token: string,
   chatId: number,
   threadId: number | undefined,
+  isPrivate: boolean,
   intervalMs = 500
 ): { onChunk: (text: string) => void; getAccumulated: () => string } {
   let accumulated = "";
   let lastSentAt = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  // draft_id is fixed for this message — same ID = animated update
+  const draftId = Math.floor(Math.random() * 2 ** 30) + 1;
 
   const flush = () => {
-    if (!accumulated) return;
+    if (!accumulated || !isPrivate) return;
     lastSentAt = Date.now();
-    sendMessageDraft(token, chatId, accumulated, threadId);
+    sendMessageDraft(token, chatId, draftId, accumulated, threadId);
   };
 
   const onChunk = (text: string) => {
@@ -678,7 +689,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     if (busy) {
       result = await runFork(prefixedPrompt);
     } else {
-      const stream = makeStreamCallback(config.token, chatId, threadId);
+      const stream = makeStreamCallback(config.token, chatId, threadId, isPrivate);
       result = await runUserMessage("telegram", prefixedPrompt, stream.onChunk);
     }
 
