@@ -149,7 +149,8 @@ async function runClaudeStreaming(
   let finalResult = "";
   let sessionId: string | undefined;
   let isRateLimit = false;
-  let delivered = ""; // text already sent to onChunk
+  let delivered = ""; // text already sent to onChunk for the current message
+  let lastMsgId = ""; // reset delivered tracking when a new assistant message starts
 
   const reader = proc.stdout.getReader();
   const decoder = new TextDecoder();
@@ -170,6 +171,12 @@ async function runClaudeStreaming(
         const event = JSON.parse(line);
 
         if (event.type === "assistant" && event.message?.content && onChunk) {
+          const msgId: string = event.message.id ?? "";
+          if (msgId !== lastMsgId) {
+            // New assistant turn — reset tracking
+            delivered = "";
+            lastMsgId = msgId;
+          }
           // Accumulate text across all content blocks in this message
           let full = "";
           for (const block of event.message.content) {
