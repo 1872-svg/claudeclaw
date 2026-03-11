@@ -322,6 +322,7 @@ function makeStreamCallback(
   let timer: ReturnType<typeof setTimeout> | null = null;
   let streamMsgId: number | null = null;
   let initPromise: Promise<void> | null = null;
+  let finalized = false;
 
   const getDisplay = () => {
     const toolPart = toolLines.join("\n");
@@ -329,7 +330,7 @@ function makeStreamCallback(
   };
 
   const editStream = () => {
-    if (!streamMsgId) return;
+    if (!streamMsgId || finalized) return;
     const display = verbose ? getDisplay() : textAcc;
     if (!display) return;
     callApi(token, "editMessageText", {
@@ -394,6 +395,7 @@ function makeStreamCallback(
   const waitForStreamMsg = async (): Promise<number | null> => {
     if (timer) { clearTimeout(timer); timer = null; }
     if (initPromise) await initPromise;
+    finalized = true;
     return streamMsgId;
   };
 
@@ -769,12 +771,19 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       }
       const finalText = cleanedText || "(empty response)";
       if (streamMsgId) {
-        // Edit the streaming message with final formatted HTML
+        // Edit the streaming message with final formatted HTML.
+        // editStream() already set the message to the correct plain text content,
+        // so if all edits fail (e.g. "message is not modified"), do NOT send a new
+        // message — the user already sees the correct content and a sendMessage
+        // would create a duplicate.
         const html = markdownToTelegramHtml(normalizeTelegramText(finalText));
         await callApi(config.token, "editMessageText", {
           chat_id: chatId, message_id: streamMsgId,
           text: html.slice(0, 4096), parse_mode: "HTML",
-        }).catch(() => sendMessage(config.token, chatId, finalText, threadId));
+        }).catch(() => callApi(config.token, "editMessageText", {
+          chat_id: chatId, message_id: streamMsgId,
+          text: finalText.slice(0, 4096),
+        }).catch(() => {}));
       } else {
         await sendMessage(config.token, chatId, finalText, threadId);
       }
