@@ -126,12 +126,39 @@ async function runClaudeOnce(
  * Run claude with --output-format stream-json, emitting text chunks via onChunk
  * as assistant messages arrive. Session ID and final result come from the result event.
  */
+function formatToolCallSummary(name: string, input: Record<string, unknown>): string {
+  const s = (v: unknown, max = 50) => String(v ?? "").slice(0, max);
+  switch (name) {
+    case "Write":
+    case "Edit":
+    case "Read":    return `${name}(${s(input.file_path)})`;
+    case "Bash":    return `Bash(${s(input.command, 60)})`;
+    case "Grep":    return `Grep(${s(input.pattern)} in ${s(input.path ?? ".")})`;
+    case "Glob":    return `Glob(${s(input.pattern)})`;
+    case "WebSearch": return `WebSearch(${s(input.query)})`;
+    case "WebFetch":  return `WebFetch(${s(input.url, 60)})`;
+    default:        return `${name}(...)`;
+  }
+}
+
+function extractToolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return (content as Array<{ type?: string; text?: string }>)
+      .filter(b => b.type === "text")
+      .map(b => b.text ?? "")
+      .join("");
+  }
+  return String(content ?? "");
+}
+
 async function runClaudeStreaming(
   baseArgs: string[],
   model: string,
   api: string,
   baseEnv: Record<string, string>,
-  onChunk?: (text: string) => void
+  onChunk?: (text: string) => void,
+  onToolEvent?: (line: string) => void
 ): Promise<{ result: string; stderr: string; exitCode: number; sessionId?: string; isRateLimit: boolean }> {
   const args = [...baseArgs];
   const normalizedModel = model.trim().toLowerCase();
@@ -151,6 +178,7 @@ async function runClaudeStreaming(
   let isRateLimit = false;
   let delivered = ""; // text already sent to onChunk for the current message
   let lastMsgId = ""; // reset delivered tracking when a new assistant message starts
+  const pendingToolCalls = new Map<string, string>(); // tool_use_id → tool name
 
   const reader = proc.stdout.getReader();
   const decoder = new TextDecoder();
@@ -170,22 +198,37 @@ async function runClaudeStreaming(
       try {
         const event = JSON.parse(line);
 
-        if (event.type === "assistant" && event.message?.content && onChunk) {
+        if (event.type === "assistant" && event.message?.content) {
           const msgId: string = event.message.id ?? "";
           if (msgId !== lastMsgId) {
-            // New assistant turn — reset tracking
             delivered = "";
             lastMsgId = msgId;
           }
-          // Accumulate text across all content blocks in this message
           let full = "";
           for (const block of event.message.content) {
-            if (block.type === "text" && typeof block.text === "string") full += block.text;
+            if (block.type === "text" && typeof block.text === "string") {
+              full += block.text;
+            } else if (block.type === "tool_use" && onToolEvent) {
+              pendingToolCalls.set(block.id, block.name);
+              onToolEvent(`● ${formatToolCallSummary(block.name, block.input ?? {})}`);
+            }
           }
-          // Deliver only the new portion since last delivery
-          if (full.length > delivered.length) {
+          if (onChunk && full.length > delivered.length) {
             onChunk(full.slice(delivered.length));
             delivered = full;
+          }
+        }
+
+        if (event.type === "user" && onToolEvent) {
+          for (const block of event.message?.content ?? []) {
+            if (block.type === "tool_result") {
+              const name = pendingToolCalls.get(block.tool_use_id) ?? "?";
+              pendingToolCalls.delete(block.tool_use_id);
+              const text = extractToolResultText(block.content);
+              const firstLine = text.split("\n")[0].slice(0, 80);
+              const summary = block.is_error ? `Error: ${firstLine}` : (firstLine || "done");
+              onToolEvent(`  ⎿  [${name}] ${summary}`);
+            }
           }
         }
 
@@ -330,7 +373,7 @@ export async function loadHeartbeatPromptTemplate(): Promise<string> {
   return "";
 }
 
-async function execClaude(name: string, prompt: string, onChunk?: (text: string) => void): Promise<RunResult> {
+async function execClaude(name: string, prompt: string, onChunk?: (text: string) => void, onToolEvent?: (line: string) => void): Promise<RunResult> {
   mainRunning = true;
   try {
   await mkdir(LOGS_DIR, { recursive: true });
@@ -377,14 +420,14 @@ async function execClaude(name: string, prompt: string, onChunk?: (text: string)
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
   const baseEnv = { ...cleanEnv } as Record<string, string>;
 
-  let exec = await runClaudeStreaming(args, primaryConfig.model, primaryConfig.api, baseEnv, onChunk);
+  let exec = await runClaudeStreaming(args, primaryConfig.model, primaryConfig.api, baseEnv, onChunk, onToolEvent);
   let usedFallback = false;
 
   if (exec.isRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
     console.warn(
       `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`
     );
-    exec = await runClaudeStreaming(args, fallbackConfig.model, fallbackConfig.api, baseEnv, onChunk);
+    exec = await runClaudeStreaming(args, fallbackConfig.model, fallbackConfig.api, baseEnv, onChunk, onToolEvent);
     usedFallback = true;
   }
 
@@ -421,8 +464,8 @@ async function execClaude(name: string, prompt: string, onChunk?: (text: string)
   }
 }
 
-export async function run(name: string, prompt: string, onChunk?: (text: string) => void): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, onChunk));
+export async function run(name: string, prompt: string, onChunk?: (text: string) => void, onToolEvent?: (line: string) => void): Promise<RunResult> {
+  return enqueue(() => execClaude(name, prompt, onChunk, onToolEvent));
 }
 
 function prefixUserMessageWithClock(prompt: string): string {
@@ -436,8 +479,8 @@ function prefixUserMessageWithClock(prompt: string): string {
   }
 }
 
-export async function runUserMessage(name: string, prompt: string, onChunk?: (text: string) => void): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), onChunk);
+export async function runUserMessage(name: string, prompt: string, onChunk?: (text: string) => void, onToolEvent?: (line: string) => void): Promise<RunResult> {
+  return run(name, prefixUserMessageWithClock(prompt), onChunk, onToolEvent);
 }
 
 // Path where Claude Code stores session JSONL transcripts for this project

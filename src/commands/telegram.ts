@@ -300,35 +300,48 @@ async function sendTyping(token: string, chatId: number, threadId?: number): Pro
   }).catch(() => {});
 }
 
+// Chat IDs with verbose tool display enabled
+const verboseChats = new Set<number>();
+
 /**
  * Build a streaming callback using editMessageText.
  * On first chunk: send a placeholder message to get message_id.
  * On subsequent chunks (throttled): edit that message with accumulated plain text.
- * Returns onChunk + getStreamMsgId so the handler can do a final formatted edit.
+ * In verbose mode, tool call/result lines appear above the text response.
  */
 function makeStreamCallback(
   token: string,
   chatId: number,
   threadId: number | undefined,
-  intervalMs = 500
-): { onChunk: (text: string) => void; waitForStreamMsg: () => Promise<number | null> } {
-  let accumulated = "";
+  options: { intervalMs?: number; verbose?: boolean } = {}
+): { onChunk: (text: string) => void; onToolEvent: (line: string) => void; waitForStreamMsg: () => Promise<number | null> } {
+  const { intervalMs = 500, verbose = false } = options;
+  let textAcc = "";
+  const toolLines: string[] = [];
   let lastSentAt = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let streamMsgId: number | null = null;
   let initPromise: Promise<void> | null = null;
 
+  const getDisplay = () => {
+    const toolPart = toolLines.join("\n");
+    return toolPart + (textAcc ? (toolPart ? "\n\n" : "") + textAcc : "");
+  };
+
   const editStream = () => {
-    if (!streamMsgId || !accumulated) return;
+    if (!streamMsgId) return;
+    const display = verbose ? getDisplay() : textAcc;
+    if (!display) return;
     callApi(token, "editMessageText", {
       chat_id: chatId,
       message_id: streamMsgId,
-      text: accumulated.slice(0, 4096),
+      text: display.slice(0, 4096),
     }).catch(() => {});
   };
 
   const flush = async () => {
-    if (!accumulated) return;
+    const display = verbose ? getDisplay() : textAcc;
+    if (!display) return;
     lastSentAt = Date.now();
 
     if (!streamMsgId && !initPromise) {
@@ -355,7 +368,7 @@ function makeStreamCallback(
   };
 
   const onChunk = (text: string) => {
-    accumulated += text;
+    textAcc += text;
     const now = Date.now();
     if (now - lastSentAt >= intervalMs) {
       if (timer) { clearTimeout(timer); timer = null; }
@@ -365,14 +378,20 @@ function makeStreamCallback(
     }
   };
 
-  // Wait for any in-flight init to settle before caller checks streamMsgId
+  const onToolEvent = (line: string) => {
+    if (!verbose) return;
+    toolLines.push(line);
+    if (timer) { clearTimeout(timer); timer = null; }
+    flush();
+  };
+
   const waitForStreamMsg = async (): Promise<number | null> => {
     if (timer) { clearTimeout(timer); timer = null; }
     if (initPromise) await initPromise;
     return streamMsgId;
   };
 
-  return { onChunk, waitForStreamMsg };
+  return { onChunk, onToolEvent, waitForStreamMsg };
 }
 
 function extractReactionDirective(text: string): { cleanedText: string; reactionEmoji: string | null } {
@@ -597,6 +616,17 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
+  if (command === "/verbose") {
+    if (verboseChats.has(chatId)) {
+      verboseChats.delete(chatId);
+      await sendMessage(config.token, chatId, "Verbose mode off.", threadId);
+    } else {
+      verboseChats.add(chatId);
+      await sendMessage(config.token, chatId, "Verbose mode on — tool calls will be shown.", threadId);
+    }
+    return;
+  }
+
   if (command === "/fork") {
     const forkPrompt = text.replace(/^\/fork\s*/i, "").trim();
     if (!forkPrompt) {
@@ -704,13 +734,14 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     }
     const prefixedPrompt = promptParts.join("\n");
     const busy = isMainBusy();
+    const verbose = verboseChats.has(chatId);
     let result;
     let streamMsgId: number | null = null;
     if (busy) {
       result = await runFork(prefixedPrompt);
     } else {
-      const stream = makeStreamCallback(config.token, chatId, threadId);
-      result = await runUserMessage("telegram", prefixedPrompt, stream.onChunk);
+      const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
+      result = await runUserMessage("telegram", prefixedPrompt, stream.onChunk, stream.onToolEvent);
       streamMsgId = await stream.waitForStreamMsg();
     }
 
