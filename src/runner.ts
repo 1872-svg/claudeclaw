@@ -346,7 +346,8 @@ async function execClaude(name: string, prompt: string, onChunk?: (text: string)
   );
 
   // Always use stream-json — session_id comes from the result event for both new and resumed
-  const args = ["claude", "-p", prompt, "--output-format", "stream-json", ...securityArgs];
+  // --verbose is required by claude when using stream-json with --print
+  const args = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
   if (!isNew) args.push("--resume", existing.sessionId);
 
   // Build the appended system prompt (re-sent every turn since --append-system-prompt doesn't persist)
