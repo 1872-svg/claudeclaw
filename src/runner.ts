@@ -179,6 +179,8 @@ async function runClaudeStreaming(
   let isRateLimit = false;
   let delivered = ""; // text already sent to onChunk for the current message
   let lastMsgId = ""; // reset delivered tracking when a new assistant message starts
+  let streamedText = ""; // full accumulated text across all assistant turns (fallback for empty result)
+  let hadToolCalls = false; // track if any tool calls were made during this run
   const pendingToolCalls = new Map<string, string>(); // tool_use_id → tool name
 
   const reader = proc.stdout.getReader();
@@ -204,7 +206,10 @@ async function runClaudeStreaming(
           if (msgId !== lastMsgId) {
             // Insert newline separator between assistant messages so text
             // from successive turns doesn't merge onto one line.
-            if (onChunk && delivered) onChunk("\n");
+            if (delivered) {
+              streamedText += "\n";
+              if (onChunk) onChunk("\n");
+            }
             delivered = "";
             lastMsgId = msgId;
           }
@@ -213,12 +218,15 @@ async function runClaudeStreaming(
             if (block.type === "text" && typeof block.text === "string") {
               full += block.text;
             } else if (block.type === "tool_use" && onToolEvent) {
+              hadToolCalls = true;
               pendingToolCalls.set(block.id, block.name);
               onToolEvent(`● ${formatToolCallSummary(block.name, block.input ?? {})}`);
             }
           }
-          if (onChunk && full.length > delivered.length) {
-            onChunk(full.slice(delivered.length));
+          if (full.length > delivered.length) {
+            const delta = full.slice(delivered.length);
+            streamedText += delta;
+            if (onChunk) onChunk(delta);
             delivered = full;
           }
         }
@@ -252,7 +260,14 @@ async function runClaudeStreaming(
   // Also check stderr for rate limit signals
   if (!isRateLimit) isRateLimit = RATE_LIMIT_PATTERN.test(stderr);
 
-  return { result: finalResult, stderr, exitCode: proc.exitCode ?? 1, sessionId, isRateLimit };
+  // Fallback: if the result event had an empty/non-string result but text was
+  // Fallback chain:
+  // 1. Use finalResult if present (normal text response)
+  // 2. Fall back to streamed text if any was sent during streaming
+  // 3. If there were tool calls but no text, use "Done" to avoid empty response
+  const result = finalResult || streamedText.trim() || (hadToolCalls ? "Done" : "");
+
+  return { result, stderr, exitCode: proc.exitCode ?? 1, sessionId, isRateLimit };
 }
 
 const PROJECT_DIR = process.cwd();

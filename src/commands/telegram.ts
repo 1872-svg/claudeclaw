@@ -412,11 +412,11 @@ function makeStreamCallback(
     }
   };
 
-  const waitForStreamMsg = async (): Promise<number | null> => {
+  const waitForStreamMsg = async (): Promise<{ msgId: number | null; hadToolLines: boolean }> => {
     if (timer) { clearTimeout(timer); timer = null; }
     if (initPromise) await initPromise;
     finalized = true;
-    return streamMsgId;
+    return { msgId: streamMsgId, hadToolLines: toolLines.length > 0 };
   };
 
   return { onChunk, onToolEvent, waitForStreamMsg };
@@ -765,12 +765,15 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const verbose = verboseChats.has(chatId);
     let result;
     let streamMsgId: number | null = null;
+    let hadToolLines = false;
     if (busy) {
       result = await runFork(prefixedPrompt);
     } else {
       const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
       result = await runUserMessage("telegram", prefixedPrompt, stream.onChunk, stream.onToolEvent);
-      streamMsgId = await stream.waitForStreamMsg();
+      const streamResult = await stream.waitForStreamMsg();
+      streamMsgId = streamResult.msgId;
+      hadToolLines = streamResult.hadToolLines;
     }
 
     if (result.exitCode !== 0) {
@@ -804,9 +807,11 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
           chat_id: chatId, message_id: streamMsgId,
           text: finalText.slice(0, 4096),
         }).catch(() => {
-          // If all edits fail and verbose mode was on, the stream message still
-          // shows tool call output — send the final response as a new message.
-          if (verbose) {
+          // If all edits fail and the stream message has tool output (verbose),
+          // send the final response as a new message. But if there were no tool
+          // lines, the stream message already shows the correct text — "not
+          // modified" just means it's already right, so don't send a duplicate.
+          if (verbose && hadToolLines) {
             return sendMessage(config.token, chatId, finalText, threadId);
           }
         }));
